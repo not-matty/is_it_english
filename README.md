@@ -29,4 +29,4 @@ Train a byte LM with BOS/EOS. At eval, split long strings into 128-token windows
 
 
 
-![val loss](W&B Chart 10_14_2025, 1_42_19 AM.png "val loss")
+![val loss](val_loss.png "val loss")
