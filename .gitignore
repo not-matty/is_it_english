@@ -1,0 +1,7 @@
+out/
+data/train/
+data/eval_pairs.tsv
+data/test.rand.txt
+data/train.txt
+wandb/
+__pycache__/
