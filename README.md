@@ -1,9 +1,30 @@
+# Project: Spot the Altered Sentence
 
-## Task: train a model to classify which of two English chunks of text have been altered. 
+Goal: given two chunks of English text, decide which one was altered.
 
-Current implementation: decoder-only, byte-level LM -> sum nll and choose lower loss as original. Trained over only originals with causal mask. ~62M paramters achieves 81.6 percent accuracy on 900k samples. Basic nanoGPT fork. 
+## Current Implementation
 
-#Todo: 
-- Try appending original and altered together and train without causal mask, with logistic loss (essentially cross attention), or just try encoder style LM without causal mask.
-- Train logistic regression on top of pretrained LM.
-- Train a tokenizer, and try on bigger vocab size. 
+- **Model**: a decoder-only, byte-level Transformer (~62M params), trained from scratch (nanoGPT). Sanity check for difficulty of task.
+- **Training**: causal mask, trained only on **original** sentences.
+- **Decision rule**: score each candidate by **summed NLL** under the LM; the one with **lower loss** is treated as the original.
+- **Scale**: ~900k pairs (typically 1–2 sentences).
+- **Current result**: **81.6%** accuracy.
+
+
+## How it works
+
+Train a byte LM with BOS/EOS. At eval, split long strings into 128-token windows, sum token NLLs for A and B, pick the smaller sum.
+
+
+## Todo
+
+- **bidirectional (no causal mask)**  
+  Concatenate `A [SEP] B` and train a small cross-encoder with a logistic loss to choose the altered one. Or just use an encoder-style Transformer and classify directly. (removing causal mask)
+
+- **discriminator on top of the LM**  
+  Keep the current LM and add a tiny head (e.g., logistic regression or a small MLP) over simple features like `ΔNLL`, length terms, maybe pooled hidden states.
+
+- **test larger vocab**  
+  Train a tokenizer (e.g., BPE) and compare against bytes. 
+
+---
