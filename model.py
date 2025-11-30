@@ -227,12 +227,9 @@ class GPT(nn.Module):
             nn.Dropout(config.dropout),
             nn.Linear(config.n_embd, 1),
         )
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.mlm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # tie embeddings for MLM
+        self.transformer.wte.weight = self.mlm_head.weight
 
         # init all weights
         self.apply(self._init_weights)
@@ -264,7 +261,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, labels=None, attention_mask=None, token_type_ids=None):
+    def forward(self, idx, labels=None, attention_mask=None, token_type_ids=None, mode: str = "cls"):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -276,19 +273,26 @@ class GPT(nn.Module):
         x = tok_emb + pos_emb
         if token_type_ids is not None:
             x = x + self.transformer.wte_type(token_type_ids)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(x)
         for block in self.transformer.h:
             x = block(x, attention_mask=attention_mask)
         x = self.transformer.ln_f(x)
-        cls = x[:, 0]
-        if labels is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.classifier(cls).squeeze(-1)
-            loss = F.binary_cross_entropy_with_logits(logits, labels.float())
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.classifier(cls).squeeze(-1)
+        if mode == "mlm":
+            logits = self.mlm_head(x)
             loss = None
+            if labels is not None:
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1),
+                    ignore_index=-100,
+                )
+            return logits, loss
+
+        cls = x[:, 0]
+        logits = self.classifier(cls).squeeze(-1)
+        loss = None
+        if labels is not None:
+            loss = F.binary_cross_entropy_with_logits(logits, labels.float())
 
         return logits, loss
 

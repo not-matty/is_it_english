@@ -28,7 +28,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
-
+from muon import MuonWithAuxAdam
+from torch.optim import AdamW
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -41,8 +42,8 @@ always_save_checkpoint = True # if True, always save a checkpoint after each eva
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 early_stop_patience = 10 # number of evals without improvement before stopping; set 0 to disable
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'miniLM'
+wandb_log = True # disabled by default
+wandb_project = 'mlm'
 wandb_run_name = 'run' + str(time.time())
 # data
 dataset = 'train'
@@ -55,6 +56,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+stage = 'cls' # 'mlm' for masked LM pretrain, 'cls' for classification finetune
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -110,33 +112,55 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# data loader (cross-encoder tensors)
+# data loader (mlm or cross-encoder tensors)
+assert stage in ('mlm', 'cls')
 data_dir = os.path.join('data', dataset)
-train_npz = np.load(os.path.join(data_dir, 'train_ce.npz'))
-val_npz   = np.load(os.path.join(data_dir, 'val_ce.npz'))
-train_input_ids = train_npz['input_ids']
-train_attn = train_npz['attention_mask']
-train_labels = train_npz['labels']
-val_input_ids = val_npz['input_ids']
-val_attn = val_npz['attention_mask']
-val_labels = val_npz['labels']
+if stage == 'cls':
+    train_npz = np.load(os.path.join(data_dir, 'train_ce.npz'))
+    val_npz   = np.load(os.path.join(data_dir, 'val_ce.npz'))
+    train_input_ids = train_npz['input_ids']
+    train_attn = train_npz['attention_mask']
+    train_labels = train_npz['labels']
+    train_types = train_npz['token_type_ids']
+    val_input_ids = val_npz['input_ids']
+    val_attn = val_npz['attention_mask']
+    val_labels = val_npz['labels']
+    val_types = val_npz['token_type_ids']
+else:
+    train_npz = np.load(os.path.join(data_dir, 'train_mlm.npz'))
+    val_npz   = np.load(os.path.join(data_dir, 'val_mlm.npz'))
+    train_input_ids = train_npz['input_ids']
+    train_attn = train_npz['attention_mask']
+    train_labels = train_npz['labels']
+    val_input_ids = val_npz['input_ids']
+    val_attn = val_npz['attention_mask']
+    val_labels = val_npz['labels']
+    # no token types for mlm; fill zeros
+    train_types = np.zeros_like(train_input_ids, dtype=np.uint8)
+    val_types = np.zeros_like(val_input_ids, dtype=np.uint8)
 
 def get_batch(split):
     if split == 'train':
-        data_inputs, data_attn, data_labels = train_input_ids, train_attn, train_labels
+        data_inputs, data_attn, data_labels, data_types = train_input_ids, train_attn, train_labels, train_types
     else:
-        data_inputs, data_attn, data_labels = val_input_ids, val_attn, val_labels
+        data_inputs, data_attn, data_labels, data_types = val_input_ids, val_attn, val_labels, val_types
     ix = torch.randint(len(data_inputs), (batch_size,))
     x = torch.from_numpy(data_inputs[ix].astype(np.int64))
     attn = torch.from_numpy(data_attn[ix].astype(np.int64))
-    labels = torch.from_numpy(data_labels[ix].astype(np.float32))
+    labels = torch.from_numpy(data_labels[ix])
+    types = torch.from_numpy(data_types[ix].astype(np.int64))
     if device_type == 'cuda':
         x = x.pin_memory().to(device, non_blocking=True)
         attn = attn.pin_memory().to(device, non_blocking=True)
         labels = labels.pin_memory().to(device, non_blocking=True)
+        types = types.pin_memory().to(device, non_blocking=True)
     else:
-        x, attn, labels = x.to(device), attn.to(device), labels.to(device)
-    return x, attn, labels
+        x, attn, labels, types = x.to(device), attn.to(device), labels.to(device), types.to(device)
+    if stage == 'cls':
+        labels = labels.float()
+    else:
+        labels = labels.long()
+    return x, attn, labels, types
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -210,8 +234,27 @@ model.to(device)
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
-# optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+# hidden_weights = [p for p in model.parameters() if p.ndim >= 2]
+# gains_biases   = [p for p in model.parameters() if p.ndim < 2]
+
+# param_groups = [
+#     dict(params=hidden_weights, use_muon=True,  lr=0.02, weight_decay=0.01),
+#     dict(params=gains_biases,  use_muon=False, lr=3e-4, betas=(0.9, 0.95), weight_decay=0.01),
+# ]
+# import torch.distributed as dist, tempfile
+# if not dist.is_initialized():
+#     tmp = tempfile.NamedTemporaryFile().name
+#     dist.init_process_group(backend='gloo', init_method=f'file://{tmp}', rank=0, world_size=1)
+
+param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
+decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+param_groups = [
+    {"params": decay_params, "weight_decay": weight_decay},
+    {"params": nodecay_params, "weight_decay": 0.0},
+]
+optimizer = AdamW(param_groups, lr=learning_rate, betas=(beta1, beta2))
+
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
@@ -234,9 +277,9 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, attn, labels = get_batch(split)
+            X, attn, labels, types = get_batch(split)
             with ctx:
-                logits, loss = model(X, labels=labels, attention_mask=attn)
+                logits, loss = model(X, labels=labels, attention_mask=attn, token_type_ids=types, mode=stage)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -262,7 +305,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, attn, labels = get_batch('train') # fetch the very first batch
+X, attn, labels, types = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -319,10 +362,10 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, labels=labels, attention_mask=attn)
+            logits, loss = model(X, labels=labels, attention_mask=attn, token_type_ids=types, mode=stage)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, attn, labels = get_batch('train')
+        X, attn, labels, types = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
