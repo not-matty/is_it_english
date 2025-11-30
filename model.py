@@ -14,6 +14,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import numbers
+import torch.nn.init as init
+from typing import Union, List
+from torch import Size, Tensor
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -25,6 +29,40 @@ class LayerNorm(nn.Module):
 
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, normalized_shape: Union[int, List[int], Size], eps: float = 1e-5, bias: bool = False) -> None:
+        super(RMSNorm, self).__init__()
+        if isinstance(normalized_shape, numbers.Integral):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = tuple(normalized_shape)
+        self.eps = eps
+        self.weight = nn.Parameter(torch.empty(self.normalized_shape))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(self.normalized_shape))
+        else:
+            self.register_parameter('bias', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init.ones_(self.weight)
+        if self.bias is not None:
+            init.zeros_(self.bias)
+
+    def forward(self, input: Tensor) -> Tensor:
+        var = input.pow(2).mean(dim=-1, keepdim=True) + self.eps
+        input_norm = input * torch.rsqrt(var)
+
+        rmsnorm = self.weight * input_norm
+        
+        if self.bias is not None:
+            rmsnorm = rmsnorm + self.bias
+
+        return rmsnorm
+    
 
 class CausalSelfAttention(nn.Module):
 
@@ -75,18 +113,71 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+class BidirectionalSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        """
+        Arguments:
+        d: size of embedding dimension
+        """
+        super().__init__()
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+
+        # key, query, value projections for all heads, but in a batch
+        # output is 3X the dimension because it includes key, query and value
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        
+    def forward(self, x, attention_mask=None):
+        # x: (B, T, C); attention_mask: (B, T) with 1 for real tokens, 0 for pad
+        B, T, C = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+        if self.flash:
+            attn_mask_4d = None
+            if attention_mask is not None:
+                attn_mask_4d = attention_mask[:, None, None, :].to(dtype=q.dtype, device=q.device)
+                attn_mask_4d = (attn_mask_4d == 0)  # True where masked
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask_4d,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False,
+            )
+        else:
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            if attention_mask is not None:
+                mask = attention_mask[:, None, None, :].to(dtype=att.dtype, device=att.device)
+                att = att.masked_fill(mask == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+    
+
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
+        self.silu    = nn.SiLU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = self.gelu(x)
+        x = self.silu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -95,13 +186,13 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = RMSNorm(config.n_embd, bias=config.bias)
+        self.attn = BidirectionalSelfAttention(config)
+        self.ln_2 = RMSNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, attention_mask=None):
+        x = x + self.attn(self.ln_1(x), attention_mask=attention_mask)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -122,14 +213,20 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
+            wte_type = nn.Embedding(2, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ln_f = RMSNorm(config.n_embd, bias=config.bias),
         ))
+        self.classifier = nn.Sequential(
+            nn.Linear(config.n_embd, config.n_embd),
+            nn.SiLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.n_embd, 1),
+        )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -167,27 +264,30 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, labels=None, attention_mask=None, token_type_ids=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = tok_emb + pos_emb
+        if token_type_ids is not None:
+            x = x + self.transformer.wte_type(token_type_ids)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, attention_mask=attention_mask)
         x = self.transformer.ln_f(x)
-
-        if targets is not None:
+        cls = x[:, 0]
+        if labels is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            logits = self.classifier(cls).squeeze(-1)
+            loss = F.binary_cross_entropy_with_logits(logits, labels.float())
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.classifier(cls).squeeze(-1)
             loss = None
 
         return logits, loss

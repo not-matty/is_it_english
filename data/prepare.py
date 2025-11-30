@@ -1,11 +1,10 @@
 import os, random, pickle
 import numpy as np
-import re
 random.seed(1337)
 
 current_directory = os.getcwd()
-in_path  = os.path.join(current_directory, 'train.txt')
-out_dir  = os.path.join(current_directory, 'train')
+in_path  = os.path.join(current_directory, 'data/train.txt')
+out_dir  = os.path.join(current_directory, 'data/train')
 os.makedirs(out_dir, exist_ok=True)
 
 with open(in_path, 'rb') as f:
@@ -27,40 +26,61 @@ train_pairs = pairs[:split]
 val_pairs   = pairs[split:]
 
 
-BOS, EOS, PAD = 256, 257, 258
-VOCAB_SIZE    = 259
+CLS, SEP, PAD = 256, 257, 258
+VOCAB_SIZE = 259
+BLOCK_SIZE = 1024
 
-def encode_bytes(b: bytes) -> np.ndarray:
-    x = np.frombuffer(b, dtype=np.uint8)
-    return np.concatenate(([BOS], x, [EOS])).astype(np.uint16)
-
-train_stream = []
-for o, a in train_pairs:
-    if len(o): train_stream.append(encode_bytes(o))
-    if len(a): train_stream.append(encode_bytes(a))
-val_stream = []
-for o, a in val_pairs:
-    if len(o): val_stream.append(encode_bytes(o))
-    if len(a): val_stream.append(encode_bytes(a))
-
-
-train_ids = np.concatenate(train_stream) if train_stream else np.array([], dtype=np.uint16)
-val_ids   = np.concatenate(val_stream)   if val_stream   else np.array([], dtype=np.uint16)
-
-print("train tokens:", train_ids.shape[0], "val tokens:", val_ids.shape[0])
-
-(train_ids).tofile(os.path.join(out_dir, 'train.bin'))
-(val_ids).tofile(os.path.join(out_dir, 'val.bin'))
 
 meta = {
     "vocab_size": VOCAB_SIZE,
-    "bos_id": BOS,
-    "eos_id": EOS,
+    "cls_id": CLS,
+    "sep_id": SEP,
     "pad_id": PAD,
+    "block_size": BLOCK_SIZE,
     "byte_encoding": "latin-1",
 }
+
 with open(os.path.join(out_dir, 'meta.pkl'), 'wb') as f:
     pickle.dump(meta, f)
 
 with open(os.path.join(out_dir, 'split_pairs.pkl'), 'wb') as f:
     pickle.dump({"train": train_pairs, "val": val_pairs}, f)
+
+
+def make_labeled_examples(pairs):
+    labeled = []
+    for o, a in pairs:
+        if random.random() < 0.5:
+            labeled.append((1, o, a))  # A is original
+        else:
+            labeled.append((0, a, o))  # B is original
+    return labeled
+
+
+def write_pairs(path, examples):
+    with open(path, 'wb') as f:
+        for label, A, B in examples:
+            f.write(str(label).encode('ascii') + b'\t' + A + b'\t' + B + b'\n')
+
+def encode_pair(A: bytes, B: bytes):
+    ids = [CLS, *A, SEP, *B, SEP][:BLOCK_SIZE]
+    attn = [1] * len(ids)
+    if len(ids) < BLOCK_SIZE:
+        pad_len = BLOCK_SIZE - len(ids)
+        ids += [PAD] * pad_len
+        attn += [0] * pad_len
+    return np.array(ids, np.uint16), np.array(attn, np.uint8)
+
+def build_npz(examples):
+    inp, att, lab = [], [], []
+    for label, A, B in examples:
+        ids, mask = encode_pair(A, B)
+        inp.append(ids); att.append(mask); lab.append(label)
+    return dict(input_ids=np.stack(inp), attention_mask=np.stack(att), labels=np.array(lab, np.uint8))
+
+train_labeled = make_labeled_examples(train_pairs)
+val_labeled   = make_labeled_examples(val_pairs)
+np.savez_compressed(os.path.join(out_dir, "train_ce.npz"), **build_npz(train_labeled))
+np.savez_compressed(os.path.join(out_dir, "val_ce.npz"), **build_npz(val_labeled))
+write_pairs(os.path.join(out_dir, 'train_pairs.tsv'), train_labeled)
+write_pairs(os.path.join(out_dir, 'val_pairs.tsv'), val_labeled)
