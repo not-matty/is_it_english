@@ -34,6 +34,3 @@ Train a byte LM with BOS/EOS. At eval, split long strings into 128-token windows
 - **test larger vocab**  
   Train a tokenizer (e.g., BPE) and compare against bytes. 
 
-
-
-![val loss](val_loss.png "val loss")
