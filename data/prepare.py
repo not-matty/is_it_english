@@ -64,24 +64,55 @@ def write_pairs(path, examples):
             f.write(str(label).encode('ascii') + b'\t' + A + b'\t' + B + b'\n')
 
 def encode_pair(A: bytes, B: bytes):
-    ids = [CLS]
-    types = [0]
-    for byte in A:
-        if len(ids) >= BLOCK_SIZE:
-            break
-        ids.append(byte)
-        types.append(0)
-    if len(ids) < BLOCK_SIZE:
-        ids.append(SEP)
-        types.append(0)
-    for byte in B:
-        if len(ids) >= BLOCK_SIZE:
-            break
-        ids.append(byte)
-        types.append(1)
-    if len(ids) < BLOCK_SIZE:
-        ids.append(SEP)
-        types.append(1)
+    max_len = BLOCK_SIZE - 3  # reserve CLS and two SEP
+
+    def diff_span(x: bytes, y: bytes):
+        minlen = min(len(x), len(y))
+        start = None
+        for i in range(minlen):
+            if x[i] != y[i]:
+                start = i
+                break
+        if start is None:
+            if len(x) != len(y):
+                start = minlen
+            else:
+                return None, None
+        end = minlen - 1
+        while end >= 0 and x[end] == y[end]:
+            end -= 1
+        if end < start:
+            end = start
+        return start, end
+
+    ds, de = diff_span(A, B)
+    if ds is None:
+        trimmed_a = A[:max_len]
+        trimmed_b = B[:max_len]
+    else:
+        diff_len = de - ds + 1
+        budget = max_len - diff_len
+        left_budget = budget // 2
+        right_budget = budget - left_budget
+        start_a = max(0, ds - left_budget)
+        end_a = min(len(A), de + 1 + right_budget)
+        trimmed_a = A[start_a:end_a]
+
+        # align B span
+        start_b = start_a
+        end_b = end_a
+        trimmed_b = B[start_b:end_b]
+
+        # if still too long, trim equally
+        if len(trimmed_a) > max_len:
+            trimmed_a = trimmed_a[:max_len]
+        if len(trimmed_b) > max_len:
+            trimmed_b = trimmed_b[:max_len]
+
+    ids = [CLS] + list(trimmed_a) + [SEP] + list(trimmed_b) + [SEP]
+    ids = ids[:BLOCK_SIZE]
+    types = [0] * (1 + len(trimmed_a) + 1) + [1] * (min(len(trimmed_b), BLOCK_SIZE - len(ids) + len(trimmed_b)) + 1)
+    types = types[:len(ids)]
     attn = [1] * len(ids)
     if len(ids) < BLOCK_SIZE:
         pad_len = BLOCK_SIZE - len(ids)

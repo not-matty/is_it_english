@@ -34,13 +34,13 @@ from torch.optim import AdamW
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
+eval_interval = 200
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
-early_stop_patience = 10 # number of evals without improvement before stopping; set 0 to disable
+early_stop_patience = 2 # number of evals without improvement before stopping; set 0 to disable
 # wandb logging
 wandb_log = True # disabled by default
 wandb_project = 'mlm'
@@ -115,17 +115,110 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # data loader (mlm or cross-encoder tensors)
 assert stage in ('mlm', 'cls')
 data_dir = os.path.join('data', dataset)
+# attempt to derive vocab_size and block_size from the dataset
+meta_path = os.path.join(data_dir, 'meta.pkl')
+meta_vocab_size = None
+meta_block_size = None
+meta = {}
+if os.path.exists(meta_path):
+    with open(meta_path, 'rb') as f:
+        meta = pickle.load(f)
+    meta_vocab_size = meta['vocab_size']
+    meta_block_size = meta.get('block_size', None)
+    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+    if meta_block_size is not None:
+        block_size = meta_block_size
+        print(f"found block_size = {block_size} (inside {meta_path})")
+
 if stage == 'cls':
-    train_npz = np.load(os.path.join(data_dir, 'train_ce.npz'))
-    val_npz   = np.load(os.path.join(data_dir, 'val_ce.npz'))
-    train_input_ids = train_npz['input_ids']
-    train_attn = train_npz['attention_mask']
-    train_labels = train_npz['labels']
-    train_types = train_npz['token_type_ids']
-    val_input_ids = val_npz['input_ids']
-    val_attn = val_npz['attention_mask']
-    val_labels = val_npz['labels']
-    val_types = val_npz['token_type_ids']
+    def load_pairs(path):
+        out = []
+        with open(path, 'rb') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(b'\t')
+                if len(parts) != 3:
+                    continue
+                label = int(parts[0])
+                A, B = parts[1], parts[2]
+                out.append((label, A, B))
+        return out
+
+    train_pairs_list = load_pairs(os.path.join(data_dir, 'train_pairs.tsv'))
+    val_pairs_list = load_pairs(os.path.join(data_dir, 'val_pairs.tsv'))
+
+    cls_id = meta['cls_id']
+    sep_id = meta['sep_id']
+    pad_id = meta['pad_id']
+
+    def trim_around_diff(A: bytes, B: bytes):
+        max_len = block_size - 3  # reserve CLS and two SEP
+        def diff_span(x: bytes, y: bytes):
+            minlen = min(len(x), len(y))
+            start = None
+            for i in range(minlen):
+                if x[i] != y[i]:
+                    start = i
+                    break
+            if start is None:
+                if len(x) != len(y):
+                    start = minlen
+                else:
+                    return None, None
+            end = minlen - 1
+            while end >= 0 and x[end] == y[end]:
+                end -= 1
+            if end < start:
+                end = start
+            return start, end
+        ds, de = diff_span(A, B)
+        if ds is None:
+            return A[:max_len], B[:max_len]
+        diff_len = de - ds + 1
+        budget = max_len - diff_len
+        left_budget = budget // 2
+        right_budget = budget - left_budget
+        start_a = max(0, ds - left_budget)
+        end_a = min(len(A), de + 1 + right_budget)
+        trimmed_a = A[start_a:end_a]
+        start_b = start_a
+        end_b = end_a
+        trimmed_b = B[start_b:end_b]
+        if len(trimmed_a) > max_len:
+            trimmed_a = trimmed_a[:max_len]
+        if len(trimmed_b) > max_len:
+            trimmed_b = trimmed_b[:max_len]
+        return trimmed_a, trimmed_b
+
+    def encode_full_pair(A: bytes, B: bytes):
+        ta, tb = trim_around_diff(A, B)
+        ids = [cls_id] + list(ta) + [sep_id] + list(tb) + [sep_id]
+        types = [0] * (1 + len(ta) + 1) + [1] * (len(tb) + 1)
+        return ids, types
+
+    def sample_window(ids, types, center_idx=None):
+        if len(ids) <= block_size:
+            chunk_ids = ids[:]
+            chunk_types = types[:]
+            attn = [1] * len(chunk_ids)
+            pad_len = block_size - len(chunk_ids)
+            if pad_len > 0:
+                chunk_ids += [pad_id] * pad_len
+                chunk_types += [1] * pad_len
+                attn += [0] * pad_len
+            return chunk_ids, chunk_types, attn
+        max_start = len(ids) - block_size
+        if center_idx is None:
+            start = random.randint(0, max_start)
+        else:
+            start = max(0, center_idx - block_size // 2)
+            start = min(start, max_start)
+        chunk_ids = ids[start:start + block_size]
+        chunk_types = types[start:start + block_size]
+        attn = [1] * block_size
+        return chunk_ids, chunk_types, attn
 else:
     train_npz = np.load(os.path.join(data_dir, 'train_mlm.npz'))
     val_npz   = np.load(os.path.join(data_dir, 'val_mlm.npz'))
@@ -140,15 +233,31 @@ else:
     val_types = np.zeros_like(val_input_ids, dtype=np.uint8)
 
 def get_batch(split):
-    if split == 'train':
-        data_inputs, data_attn, data_labels, data_types = train_input_ids, train_attn, train_labels, train_types
+    if stage == 'cls':
+        data_pairs = train_pairs_list if split == 'train' else val_pairs_list
+        batch_ids, batch_attn, batch_labels, batch_types = [], [], [], []
+        for _ in range(batch_size):
+            label, A, B = random.choice(data_pairs)
+            ids, types = encode_full_pair(A, B)
+            chunk_ids, chunk_types, attn = sample_window(ids, types)
+            batch_ids.append(chunk_ids)
+            batch_types.append(chunk_types)
+            batch_attn.append(attn)
+            batch_labels.append(label)
+        x = torch.tensor(batch_ids, dtype=torch.long)
+        attn = torch.tensor(batch_attn, dtype=torch.long)
+        types = torch.tensor(batch_types, dtype=torch.long)
+        labels = torch.tensor(batch_labels, dtype=torch.float32)
     else:
-        data_inputs, data_attn, data_labels, data_types = val_input_ids, val_attn, val_labels, val_types
-    ix = torch.randint(len(data_inputs), (batch_size,))
-    x = torch.from_numpy(data_inputs[ix].astype(np.int64))
-    attn = torch.from_numpy(data_attn[ix].astype(np.int64))
-    labels = torch.from_numpy(data_labels[ix])
-    types = torch.from_numpy(data_types[ix].astype(np.int64))
+        if split == 'train':
+            data_inputs, data_attn, data_labels, data_types = train_input_ids, train_attn, train_labels, train_types
+        else:
+            data_inputs, data_attn, data_labels, data_types = val_input_ids, val_attn, val_labels, val_types
+        ix = torch.randint(len(data_inputs), (batch_size,))
+        x = torch.from_numpy(data_inputs[ix].astype(np.int64))
+        attn = torch.from_numpy(data_attn[ix].astype(np.int64))
+        labels = torch.from_numpy(data_labels[ix])
+        types = torch.from_numpy(data_types[ix].astype(np.int64))
     if device_type == 'cuda':
         x = x.pin_memory().to(device, non_blocking=True)
         attn = attn.pin_memory().to(device, non_blocking=True)
@@ -156,29 +265,13 @@ def get_batch(split):
         types = types.pin_memory().to(device, non_blocking=True)
     else:
         x, attn, labels, types = x.to(device), attn.to(device), labels.to(device), types.to(device)
-    if stage == 'cls':
-        labels = labels.float()
-    else:
+    if stage == 'mlm':
         labels = labels.long()
     return x, attn, labels, types
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
-
-# attempt to derive vocab_size from the dataset
-meta_path = os.path.join(data_dir, 'meta.pkl')
-meta_vocab_size = None
-meta_block_size = None
-if os.path.exists(meta_path):
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    meta_vocab_size = meta['vocab_size']
-    meta_block_size = meta.get('block_size', None)
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
-    if meta_block_size is not None:
-        block_size = meta_block_size
-        print(f"found block_size = {block_size} (inside {meta_path})")
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 

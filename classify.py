@@ -1,10 +1,8 @@
-# eval_pairs.py — minimal byte-level pair scorer with B/total summary and optional limit
 import os, sys, pickle, torch, numpy as np
-from model import GPT, GPTConfig
+from LM.model import GPT, GPTConfig
 
-# --- args ---
-if len(sys.argv) < 2:
-    sys.exit("usage: python eval_pairs.py <ckpt.pt> [limit]")
+# if len(sys.argv) < 2:
+#     sys.exit("usage: python eval_pairs.py <ckpt.pt> [limit]")
 ckpt_path = sys.argv[1]
 limit = int(sys.argv[2]) if len(sys.argv) > 2 else None
 
@@ -18,15 +16,21 @@ for k in list(sd):
 gpt.load_state_dict(sd); gpt.to(device).eval()
 
 # --- meta & pairs ---
-meta = pickle.load(open(os.path.join('data','train','meta.pkl'),'rb'))
+meta = pickle.load(open(os.path.join('data','train_lm','meta.pkl'),'rb'))
 BOS, EOS = meta['bos_id'], meta['eos_id']
-eval_path = os.path.join('data','eval_pairs.tsv')
+eval_path = os.path.join('data','train','val_pairs.tsv')
 pairs = []
 with open(eval_path, 'rb') as f:
     for line in f:
         line = line.strip()
-        if line:
-            pairs.append(line)
+        if not line:
+            continue
+        parts = line.split(b'\t')
+        if len(parts) != 3:
+            continue
+        label = int(parts[0])
+        A, B = parts[1], parts[2]
+        pairs.append((label, A, B))
 if limit is not None:
     pairs = pairs[:limit]
 
@@ -44,20 +48,20 @@ def seq_nll(b: bytes) -> float:
         nll += loss.item() * Y.numel()
     return nll
 
-count_b = 0
+correct = 0
 total = 0
 
-for idx, line in enumerate(pairs):
-    A, B = line.split(b'\t', 1)
+for idx, (label, A, B) in enumerate(pairs):
     nA, nB = seq_nll(A), seq_nll(B)
-    pred = 'A' if nA < nB else 'B'
-    if pred == 'A': count_b += 1
+    pred = 1 if nA < nB else 0  # 1 means A predicted original
+    if pred == label:
+        correct += 1
     total += 1
-    #print(f"{idx}\t{nA:.6f}\t{nB:.6f}\t{pred}")
+    # print(f"{idx}\t{nA:.6f}\t{nB:.6f}\t{pred}")
 
 # --- summary ---
 if total > 0:
-    acc = count_b / total
-    print(f"# A={count_b}\ttotal={total}\taccuracy(A/total)={acc:.6f}")
+    acc = correct / total
+    print(f"# correct={correct}\ttotal={total}\taccuracy={acc:.6f}")
 else:
     print("# No pairs evaluated.")

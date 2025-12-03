@@ -1,7 +1,14 @@
 out/
+out_lm/
+out_logreg/
 data/train/
+data/train_lm/
 data/eval_pairs.tsv
 data/test.rand.txt
 data/train.txt
 wandb/
 __pycache__/
+configurator.py
+eval_pairs.tsv
+predictions.txt
+sample.py
