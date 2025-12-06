@@ -11,11 +11,36 @@ Goal: given two chunks of English text, decide which one was altered.
 - **Data prep**: `data/prepare.py` / `prepareLM.py` recreate splits, NPZs, and meta with seed 1337.
 
 
-## Setup & Replication
+## Replication
 
-- **Env**: `conda env create -f environment.yml && conda activate englishenv` (or install torch+numpy equivalent).
-- **Data**: put `data/train.txt` and `data/test.rand.txt` in place. Then run `python data/prepare.py` and `python data/prepareLM.py` (seed=1337) to regenerate splits/meta.
-- **LM**: current LM lives at `out_lm/ckpt.pt`; retrain via `LM/train.py` if desired.
-- **Logreg head**: set `TRAIN_LIMIT`/`VAL_LIMIT` in `train_logreg.py`, set `RESUME_PATH=None` unless resuming, then `python train_logreg.py` (best ckpt -> `out_logreg/ckpt.pt`).
-- **Eval**: `python eval_logreg.py --limit 5000` to check val accuracy.
-- **Inference**: `python inference.py` reads `data/test.rand.txt` and writes `predictions.txt` using the LM + logreg head.
+Env:
+```
+conda env create -f environment.yml
+conda activate englishenv
+```
+
+Data prep (seed=1337):
+```
+python data/prepare.py
+python data/prepareLM.py
+```
+
+LM (already have out_lm/ckpt.pt; retrain if desired):
+```
+python LM/train.py  # pick hyperparams in the script
+```
+
+Logreg head (adjust TRAIN_LIMIT/VAL_LIMIT in train_logreg.py, set RESUME_PATH=None unless resuming):
+```
+python train_logreg.py
+```
+
+Eval:
+```
+python eval_logreg.py --limit 5000
+```
+
+Inference:
+```
+python inference.py  # reads data/test.rand.txt, writes predictions.txt
+```
