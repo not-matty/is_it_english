@@ -11,13 +11,11 @@ Goal: given two chunks of English text, decide which one was altered.
 - **Data prep**: `data/prepare.py` / `prepareLM.py` recreate splits, NPZs, and meta with seed 1337.
 
 
-## Todo
+## Setup & Replication
 
-- **bidirectional (no causal mask)**  
-  Concatenate `A [SEP] B` and train a small cross-encoder with a logistic loss to choose the altered one. Or just use an encoder-style Transformer and classify directly. (removing causal mask)
-
-- **discriminator on top of the LM**  
-  Keep the current LM and add a tiny head (e.g., logistic regression or a small MLP) over simple features like `ΔNLL`, length terms, maybe pooled hidden states.
-
-- **test larger vocab**  
-  Train a tokenizer (e.g., BPE) and compare against bytes. 
+- **Env**: `conda env create -f environment.yml && conda activate englishenv` (or install torch+numpy equivalent).
+- **Data**: put `data/train.txt` and `data/test.rand.txt` in place. Then run `python data/prepare.py` and `python data/prepareLM.py` (seed=1337) to regenerate splits/meta.
+- **LM**: current LM lives at `out_lm/ckpt.pt`; retrain via `LM/train.py` if desired.
+- **Logreg head**: set `TRAIN_LIMIT`/`VAL_LIMIT` in `train_logreg.py`, set `RESUME_PATH=None` unless resuming, then `python train_logreg.py` (best ckpt -> `out_logreg/ckpt.pt`).
+- **Eval**: `python eval_logreg.py --limit 5000` to check val accuracy.
+- **Inference**: `python inference.py` reads `data/test.rand.txt` and writes `predictions.txt` using the LM + logreg head.
