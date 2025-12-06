@@ -4,11 +4,11 @@ Goal: given two chunks of English text, decide which one was altered.
 
 ## Current Scheme (LM + windowed features + MLP head)
 
-**LM**: decoder-only byte-level Transformer (`out_lm/ckpt.pt`) trained on original sentences (BOS/EOS). Training and model architecture from nanoGPT, with implementation of RMSNorm.
-**Features**: windowed NLL around the diff span (Δ window NLL, normalized deltas) plus simple length features computed with fixed LM weights.
-**Head**: MLP block from `model.py` and linear logit trained on labeled pairs via `train_logreg.py`.
-**Inference**: `inference.py` rebuilds the same features for `data/test.rand.txt` and writes `A`/`B` predictions to `predictions.txt` using the saved head and scaler.
-**Data prep**: `eval_logreg.py` tests classifier on validation set, with around ~97% accuracy.
+**LM**: decoder-only byte-level Transformer (`out_lm/ckpt.pt`) trained on original sentences (BOS/EOS). Training and model architecture from nanoGPT, with implementation of RMSNorm.\
+**Features**: windowed NLL around the diff span (Δ window NLL, normalized deltas) plus simple length features computed with fixed LM weights.\
+**Head**: MLP block from `model.py` and linear logit trained on labeled pairs via `train_logreg.py`.\
+**Inference**: `inference.py` rebuilds the same features for `data/test.rand.txt` and writes `A`/`B` predictions to `predictions.txt` using the saved head and scaler.\
+**Data prep**: `eval_logreg.py` tests classifier on validation set, with around ~97% accuracy.\
 **Ruin English**: `ruin_english.ipynb` makes simple alterations found in train.txt, but also "cut", where the original sentence is cut down somewhere with a space/punctuation and orders are reversed (like a cut to a deck of cards), and change last word with the trained LM, which should in theory lower nll with temperature 0 sampling. 
 
 
