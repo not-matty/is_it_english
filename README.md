@@ -11,7 +11,7 @@ Goal: given two chunks of English text, decide which one was altered.
 - **Data prep**: `data/prepare.py` / `prepareLM.py` recreate splits, NPZs, and meta with seed 1337.
 
 
-## Replication
+## Setup
 
 Env:
 ```
