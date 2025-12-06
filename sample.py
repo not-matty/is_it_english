@@ -5,12 +5,14 @@ import os
 import pickle
 from contextlib import nullcontext
 import torch
-import tiktoken
-from model import GPTConfig, GPT
+import sys
+sys.path.append("/home/matthew/code/is_it_english")
+
+from LM.model import GPT, GPTConfig
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out' # ignored if init_from is not 'resume'
+out_dir = 'out_lm' # ignored if init_from is not 'resume'
 start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
@@ -53,25 +55,28 @@ model.to(device)
 if compile:
     model = torch.compile(model) # requires PyTorch 2.0 (optional)
 
-# look for the meta pickle in case it is available in the dataset folder
-load_meta = False
-if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...
-    meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
-    load_meta = os.path.exists(meta_path)
-if load_meta:
-    print(f"Loading meta from {meta_path}...")
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    # TODO want to make this more general to arbitrary encoder/decoder schemes
-    stoi, itos = meta['stoi'], meta['itos']
-    encode = lambda s: [stoi[c] for c in s]
-    decode = lambda l: ''.join([itos[i] for i in l])
-else:
-    # ok let's assume gpt-2 encodings by default
-    print("No meta.pkl found, assuming GPT-2 encodings...")
-    enc = tiktoken.get_encoding("gpt2")
-    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-    decode = lambda l: enc.decode(l)
+# load byte-level meta for LM
+meta_path = os.path.join('data', 'train_lm', 'meta.pkl')
+if not os.path.exists(meta_path):
+    raise FileNotFoundError(f"meta.pkl not found at {meta_path}")
+with open(meta_path, 'rb') as f:
+    meta = pickle.load(f)
+byte_encoding = meta.get('byte_encoding', 'latin-1')
+BOS = meta.get('bos_id', 256)
+EOS = meta.get('eos_id', 257)
+PAD = meta.get('pad_id', 258)
+
+def encode(text: str):
+    b = text.encode(byte_encoding, errors='replace')
+    return [BOS] + list(b)
+
+def decode(ids):
+    buf = bytearray()
+    for i in ids:
+        if i in (BOS, EOS, PAD) or i > 255:
+            continue
+        buf.append(i)
+    return buf.decode(byte_encoding, errors='ignore')
 
 # encode the beginning of the prompt
 if start.startswith('FILE:'):

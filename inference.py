@@ -12,7 +12,7 @@ from LM.model import GPT, GPTConfig, MLP
 LOGREG_CKPT = os.path.join("out_logreg", "ckpt.pt")
 PAIRS_PATH = os.path.join("data", "test.rand.txt")
 META_PATH = os.path.join("data", "train_lm", "meta.pkl")
-OUT_PATH = "predictions.txt"
+OUT_PATH = "part1.txt"
 
 
 def diff_span(x: bytes, y: bytes) -> Tuple[int | None, int | None]:

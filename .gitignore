@@ -12,3 +12,5 @@ configurator.py
 eval_pairs.tsv
 predictions.txt
 sample.py
+identical_pairs.tsv
+val_part2.tsv
