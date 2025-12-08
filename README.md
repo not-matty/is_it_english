@@ -16,6 +16,12 @@ Goal: given two chunks of English text, decide which one was altered.
 
 **Ruin English**: `ruin_english.ipynb` makes simple alterations found in train.txt, but also "cut", where the original sentence is cut down somewhere with a space/punctuation and orders are reversed (like a cut to a deck of cards), and change last word with the trained LM, which should in theory lower nll with temperature 0 sampling. 
 
+## Part 1 Files:
+`LM/model.py`, `LM/train.py`, `data/prepare.py`, `data/prepareLM.py`, `eval_logreg.py`, `inference.py`, `sample.py`, `train_logreg.py`
+
+## Part 2 Files:
+`ruin_english.ipynb`
+
 
 ## Setup
 
