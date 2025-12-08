@@ -1,3 +1,11 @@
+"""
+Run inference on test pairs with the trained LM+logreg head and write predictions.
+Follows the NanoGPT-style script flow: load checkpoints, build features, score, save.
+
+Usage:
+$ python inference.py
+"""
+
 import os
 import pickle
 from typing import List, Tuple
@@ -8,7 +16,7 @@ from torch import nn
 
 from LM.model import GPT, GPTConfig, MLP
 
-# Paths
+# Paths and outputs
 LOGREG_CKPT = os.path.join("out_logreg", "ckpt.pt")
 PAIRS_PATH = os.path.join("data", "test.rand.txt")
 META_PATH = os.path.join("data", "train_lm", "meta.pkl")
@@ -59,6 +67,7 @@ def trim_around_diff(A: bytes, B: bytes, max_len: int) -> Tuple[bytes, bytes]:
 
 
 def read_pairs(path: str) -> List[Tuple[bytes, bytes]]:
+    # test file has two tab-separated sequences per line, no labels
     pairs = []
     with open(path, "rb") as f:
         for line in f:
@@ -73,6 +82,7 @@ def read_pairs(path: str) -> List[Tuple[bytes, bytes]]:
 
 
 def load_lm(ckpt_path: str, device: str) -> GPT:
+    # mirror LM/train.py loading; strip any _orig_mod prefix that torch.compile may add
     ckpt = torch.load(ckpt_path, map_location=device)
     margs = ckpt["model_args"]
     model = GPT(GPTConfig(**margs))
@@ -94,6 +104,7 @@ def seq_nll(model: GPT, b: bytes, BOS: int, EOS: int, block_size: int, device: s
     """Sum NLL over the sequence using chunked forward passes."""
     x = np.concatenate(([BOS], np.frombuffer(b, dtype=np.uint8), [EOS])).astype(np.int64)
     nll = 0.0
+    # process in chunks to respect block_size and avoid OOM
     for i in range(0, len(x), block_size):
         chunk = torch.from_numpy(x[i : i + block_size])
         if len(chunk) < 2:
@@ -107,6 +118,7 @@ def seq_nll(model: GPT, b: bytes, BOS: int, EOS: int, block_size: int, device: s
 
 
 def build_features(model: GPT, pairs, BOS: int, EOS: int, block_size: int, window_max_len: int, device: str):
+    # compute lightweight feature vector per pair based on LM NLL deltas and lengths
     feats = []
     for A, B in pairs:
         lenA, lenB = len(A), len(B)
@@ -137,6 +149,7 @@ def build_features(model: GPT, pairs, BOS: int, EOS: int, block_size: int, windo
 
 
 def main():
+    # load checkpoints/config
     if not os.path.exists(LOGREG_CKPT):
         raise FileNotFoundError(f"Logreg checkpoint not found at {LOGREG_CKPT}")
     logreg = torch.load(LOGREG_CKPT, map_location="cpu")
@@ -152,6 +165,7 @@ def main():
     BOS, EOS = load_meta()
     block_size = lm.config.block_size
 
+    # feature construction
     pairs = read_pairs(PAIRS_PATH)
     print(f"Scoring {len(pairs)} pairs from {PAIRS_PATH}")
 
@@ -167,6 +181,7 @@ def main():
         logits = head(feats_std.to(device)).squeeze(1).cpu()
     preds = ["A" if logit.item() > 0 else "B" for logit in logits]
 
+    # write output file
     with open(OUT_PATH, "w") as f:
         for p in preds:
             f.write(p + "\n")

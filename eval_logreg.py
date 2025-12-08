@@ -1,3 +1,11 @@
+"""
+Evaluate the saved logistic-regression head on validation pairs
+load LM + head, build features, and report accuracy. Should try pooling hidden state if necessary for better accuracy?
+
+Example:
+$ python eval_logreg.py --ckpt out_logreg/ckpt.pt --val data/train/val_pairs.tsv --limit 10000
+"""
+
 import argparse
 import os
 import pickle
@@ -54,6 +62,7 @@ def trim_around_diff(A: bytes, B: bytes, max_len: int) -> Tuple[bytes, bytes]:
 
 
 def load_lm(ckpt_path: str, device: str) -> GPT:
+    # mirror LM/train.py loading; strip any _orig_mod prefix that torch.compile may add
     ckpt = torch.load(ckpt_path, map_location=device)
     margs = ckpt["model_args"]
     model = GPT(GPTConfig(**margs))
@@ -75,6 +84,7 @@ def seq_nll(model: GPT, b: bytes, BOS: int, EOS: int, block_size: int, device: s
     """Sum NLL over the sequence using chunked forward passes."""
     x = np.concatenate(([BOS], np.frombuffer(b, dtype=np.uint8), [EOS])).astype(np.int64)
     nll = 0.0
+    # process in chunks wrt block_size
     for i in range(0, len(x), block_size):
         chunk = torch.from_numpy(x[i : i + block_size])
         if len(chunk) < 2:
@@ -106,6 +116,7 @@ def load_pairs(path: str, limit: int | None) -> List[Tuple[int, bytes, bytes]]:
 
 
 def build_features(model: GPT, pairs, BOS: int, EOS: int, block_size: int, window_max_len: int, device: str):
+    # compute feature vector per pair based on LM NLL deltas and lengths
     feats = []
     labels = []
     for label, A, B in pairs:
@@ -166,7 +177,7 @@ def main():
     feats, labels = build_features(lm, val_pairs, BOS, EOS, block_size, args.window, device)
     mean = ckpt["mean"]
     std = ckpt["std"]
-    feats_std = (feats - mean) / std
+    feats_std = (feats - mean) / std  # standardize using training-time stats
 
     cfg = type("Cfg", (), {"n_embd": feats.shape[1], "bias": True, "dropout": 0.0})
     head = nn.Sequential(MLP(cfg), nn.Linear(feats.shape[1], 1))
